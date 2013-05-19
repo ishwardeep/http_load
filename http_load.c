@@ -31,6 +31,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -86,6 +87,9 @@ typedef struct {
     long bytes;
     int got_checksum;
     long checksum;
+    int method;
+    char* body;
+    long body_len;
     } url;
 static url* urls;
 static int num_urls, max_urls;
@@ -102,6 +106,9 @@ static int num_sips, max_sips;
 #ifdef USE_SSL
 #define PROTO_HTTPS 1
 #endif
+
+#define METHOD_GET 0
+#define METHOD_POST 1
 
 typedef struct {
     int url_num;
@@ -190,6 +197,7 @@ static char* cipher = (char*) 0;
 /* Forwards. */
 static void usage( void );
 static void read_url_file( char* url_file );
+static char* read_complete_file( char* content_file, long* file_size); 
 static void lookup_address( int url_num );
 static void read_sip_file( char* sip_file );
 static void start_connection( struct timeval* nowP );
@@ -540,10 +548,187 @@ usage( void )
 	"One end specifier, either -fetches or -seconds, is required.\n" );
     exit( 1 );
     }
-
+/**
+* Format of the url file is 
+* <Method>:<url>:<file name with body>
+* GET:http://localhost:port/path?querystring:
+* POST:http://localhost:port/path?querystring:req1.txt
+*
+**/
 
 static void
 read_url_file( char* url_file )
+    {
+    FILE* fp;
+    char line[5000], hostname[5000], url_query_str[5000];
+    char* http = "http://";
+    int http_len = strlen( http );
+#ifdef USE_SSL
+    char* https = "https://";
+    int https_len = strlen( https );
+#endif
+    int proto_len, host_len, method_len, url_query_str_len;
+    char* cp, *lp;
+
+    fp = fopen( url_file, "r" );
+    if ( fp == (FILE*) 0 )
+	{
+	perror( url_file );
+	exit( 1 );
+	}
+
+    max_urls = 100;
+    urls = (url*) malloc_check( max_urls * sizeof(url) );
+    num_urls = 0;
+    while ( fgets( line, sizeof(line), fp ) != (char*) 0 )
+	{
+	/* Nuke trailing newline. */
+	if ( line[strlen( line ) - 1] == '\n' )
+	    line[strlen( line ) - 1] = '\0';
+
+	/* Check for room in urls. */
+	if ( num_urls >= max_urls )
+	    {
+	    max_urls *= 2;
+	    urls = (url*) realloc_check( (void*) urls, max_urls * sizeof(url) );
+	    }
+
+	/* Add to table. */
+	urls[num_urls].url_str = strdup_check( line );
+
+        lp = line;
+        /* Parse http method */
+        if ( strncmp("GET:", line, 4) == 0) 
+        {
+	    urls[num_urls].method = METHOD_GET;
+            method_len = 4;
+        }
+        else if ( strncmp("POST:", line, 5) == 0)
+        {
+	    urls[num_urls].method = METHOD_POST;
+            method_len = 5;
+        }
+        else 
+        {
+	    (void) fprintf( stderr, "%s: unknown method - %s\n", argv0, line );
+	    exit( 1 );
+        }
+
+        lp += method_len;
+	/* Parse it. */
+	if ( strncmp( http, lp , http_len ) == 0 )
+	    {
+	    proto_len = http_len;
+	    urls[num_urls].protocol = PROTO_HTTP;
+	    }
+#ifdef USE_SSL
+	else if ( strncmp( https, lp, https_len ) == 0 )
+	    {
+	    proto_len = https_len;
+	    urls[num_urls].protocol = PROTO_HTTPS;
+	    }
+#endif
+	else
+	    {
+	    (void) fprintf( stderr, "%s: unknown protocol - %s\n", argv0, line );
+	    exit( 1 );
+	    }
+
+        lp += proto_len;
+	for ( cp = lp ;
+	     *cp != '\0' && *cp != ':' && *cp != '/'; ++cp )
+	    ;
+	host_len = cp - lp;
+	/* host_len -= (proto_len + method_len); */
+	strncpy( hostname, lp , host_len );
+	hostname[host_len] = '\0';
+	urls[num_urls].hostname = strdup_check( hostname );
+	if ( *cp == ':' )
+	    {
+	    urls[num_urls].port = (unsigned short) atoi( ++cp );
+	    while ( *cp != '\0' && *cp != '/' )
+		++cp;
+	    }
+	else
+#ifdef USE_SSL
+	    if ( urls[num_urls].protocol == PROTO_HTTPS )
+		urls[num_urls].port = 443;
+	    else
+		urls[num_urls].port = 80;
+#else
+	    urls[num_urls].port = 80;
+#endif
+	if ( *cp == '\0' ) 
+        {
+	    urls[num_urls].filename = strdup_check( "/" );
+        }
+	else
+        {
+            lp = cp;
+	    while ( *cp != '\0' && *cp != ':' )
+            {
+		++cp;
+	    }
+            url_query_str_len = cp - lp;
+            strncpy( url_query_str, lp, url_query_str_len );
+            url_query_str[url_query_str_len] = '\0';
+
+	    urls[num_urls].filename = strdup_check( url_query_str );
+        }
+	lookup_address( num_urls );
+
+        /* for POST request extract file name with content of body */
+        /* skip : before file name */
+        ++cp;
+	urls[num_urls].body = read_complete_file (cp, &urls[num_urls].body_len);
+
+	urls[num_urls].got_bytes = 0;
+	urls[num_urls].got_checksum = 0;
+	++num_urls;
+	}
+    }
+/*
+* This function is used to read the content of a file
+*
+*/
+static char* read_complete_file( char* content_file, long* file_size) 
+{
+    int fd=0, r=0;
+    char* content;
+    struct stat fileStat;
+
+    if((fd=open(content_file,O_RDONLY)) < -1)
+       return NULL;
+
+    if(fstat(fd,&fileStat) < 0)    
+    {
+       (void) fprintf( stderr, "%s: cannot fetch file size error - %s:%s\n", argv0, "read_complete_file", content_file );
+       close( fd);
+       exit( 1 );
+    }
+
+    *file_size = fileStat.st_size;
+    content = (char*) malloc(*file_size);
+    if (content == NULL) {
+       (void) fprintf( stderr, "%s: memory allocation error - %s:%s\n", argv0, "read_complete_file", content_file );
+       close( fd);
+       exit( 1 );
+    }
+
+    r = read(fd, content, *file_size);
+    if (r != *file_size) {
+       (void) fprintf( stderr, "%s: unable to read complete file error - %s:%s\n", argv0, "read_complete_file", content_file );
+       close( fd);
+       exit( 1 );
+    }
+
+    close(fd);
+
+    return content;
+}
+
+static void
+read_url_file_orig( char* url_file )
     {
     FILE* fp;
     char line[5000], hostname[5000];
@@ -1036,16 +1221,43 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
 #endif
 	}
     else
-	bytes = snprintf(
+        if (urls[url_num].method == METHOD_GET)
+        {
+	    bytes = snprintf(
 	    buf, sizeof(buf), "GET %s HTTP/1.0\r\n",
 	    urls[url_num].filename );
+        }
+        else if (urls[url_num].method == METHOD_POST)
+        {
+	    bytes = snprintf(
+	    buf, sizeof(buf), "POST %s HTTP/1.0\r\n",
+	    urls[url_num].filename );
+        }
+        else {
+            (void) fprintf(
+            stderr, "invalid http method : %s\n", urls[url_num].filename );
+            close_connection( cnum );
+        }
     bytes += snprintf(
 	&buf[bytes], sizeof(buf) - bytes, "Host: %s\r\n",
 	urls[url_num].hostname );
     bytes += snprintf(
 	&buf[bytes], sizeof(buf) - bytes, "User-Agent: %s\r\n", VERSION );
+
+    if (urls[url_num].method == METHOD_POST)
+    {
+        bytes += snprintf(
+	&buf[bytes], sizeof(buf) - bytes, "Content-Length: %ld\r\n", urls[url_num].body_len );
+    }
     bytes += snprintf( &buf[bytes], sizeof(buf) - bytes, "\r\n" );
 
+    /** add content */
+    if (urls[url_num].method == METHOD_POST)
+    {
+        bytes += snprintf(
+	&buf[bytes], sizeof(buf) - bytes, "%s", urls[url_num].body );
+    }
+     
     if (bytes >= sizeof(buf)-1) {
         (void) fprintf(
             stderr, "request skipped, too long: %s\n", urls[url_num].filename );
