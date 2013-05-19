@@ -727,6 +727,8 @@ static char* read_complete_file( char* content_file, long* file_size)
     return content;
 }
 
+/* This is original function that existed before the tool was enhanced to support POST */
+
 static void
 read_url_file_orig( char* url_file )
     {
